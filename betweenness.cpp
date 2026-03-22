@@ -70,6 +70,30 @@ static double currentRSSMB() {
     return 0.0;
 }
 
+static void showProgressBar(int completed, int total, const chrono::steady_clock::time_point& start) {
+    if (total <= 0) {
+        return;
+    }
+
+    constexpr int kBarWidth = 40;
+    const double percent = (static_cast<double>(completed) / total) * 100.0;
+    const int filled = max(0, min(kBarWidth, static_cast<int>((percent / 100.0) * kBarWidth)));
+    const auto now = chrono::steady_clock::now();
+    const double elapsed = chrono::duration<double>(now - start).count();
+    const double rate = completed > 0 ? elapsed / completed : 0.0;
+    const double eta = rate > 0.0 ? rate * (total - completed) : 0.0;
+
+    cerr << '\r';
+    cerr << '[' << string(filled, '#') << string(kBarWidth - filled, ' ') << "] ";
+    cerr << fixed << setprecision(2) << setw(6) << percent << "% ";
+    cerr << '(' << completed << '/' << total << ") ";
+    cerr << "ETA " << fixed << setprecision(1) << eta << 's';
+    if (completed >= total) {
+        cerr << '\n';
+    }
+    cerr.flush();
+}
+
 static size_t estimateMemoryBytes(size_t n, long long m) {
     size_t total = 0;
     total += sizeof(vector<int>) * n;                  // adjacency list headers
@@ -147,6 +171,7 @@ static Result computeBetweenness(const Graph& graph) {
 
     const double rss_before = currentRSSMB();
     const auto start = chrono::steady_clock::now();
+    const int progress_interval = max(1, n / 200);
 
     for (int source = 0; source < n; ++source) {
         queue<int> bfs_queue;
@@ -193,6 +218,10 @@ static Result computeBetweenness(const Graph& graph) {
             dist[v] = -1;
             delta[v] = 0.0;
             predecessors[v].clear();
+        }
+
+        if ((source + 1) % progress_interval == 0 || source + 1 == n) {
+            showProgressBar(source + 1, n, start);
         }
     }
 
