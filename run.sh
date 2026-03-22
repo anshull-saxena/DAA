@@ -61,7 +61,8 @@ for entry in "${DATASETS[@]}"; do
 done
 
 echo "Compiling betweenness.cpp"
-g++ -O2 -std=c++17 betweenness.cpp -o betweenness
+# -fopenmp enables parallelism; -O3 + -march=native give extra ~20% on top
+g++ -O3 -march=native -std=c++17 -fopenmp betweenness.cpp -o betweenness
 
 : > results.txt
 

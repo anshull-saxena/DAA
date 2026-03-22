@@ -8,4 +8,38 @@ B. Individual Contributions
 
 C. Program Output
 
-[Run `bash run.sh` to populate this section.]
+Running dataset: email-Enron.txt
+========================================
+Dataset: email-Enron.txt
+========================================
+Graph loaded: 36692 nodes, 367662 edges
+
+--- Top 20 Nodes by Betweenness Centrality ---
+Rank   Node ID       Betweenness Score
+1      5038          87302185.666144
+2      140           81321177.243618
+3      566           48902089.561408
+4      588           47735547.410850
+5      1139          47664774.037755
+6      273           47084499.603542
+7      458           46455736.842441
+8      46            41237369.309369
+9      1028          38158505.051531
+10     292           34354900.474894
+11     195           34243029.246546
+12     370           33909734.315803
+13     823           28495505.608638
+14     136           27852316.121739
+15     76            27013128.685530
+16     286           25463780.002945
+17     734           25082229.315525
+18     543           25079905.751646
+19     1768          25067082.119316
+20     353           23247554.628678
+
+--- Performance ---
+Execution time : 103.217 seconds
+Memory usage   : 6.02 MB
+========================================
+
+Running dataset: as-skitter.txt

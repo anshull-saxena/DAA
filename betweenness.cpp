@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <omp.h>
 
 #if defined(__linux__)
 #include <sys/resource.h>
@@ -71,9 +73,7 @@ static double currentRSSMB() {
 }
 
 static void showProgressBar(int completed, int total, const chrono::steady_clock::time_point& start) {
-    if (total <= 0) {
-        return;
-    }
+    if (total <= 0) return;
 
     constexpr int kBarWidth = 40;
     const double percent = (static_cast<double>(completed) / total) * 100.0;
@@ -88,34 +88,30 @@ static void showProgressBar(int completed, int total, const chrono::steady_clock
     cerr << fixed << setprecision(2) << setw(6) << percent << "% ";
     cerr << '(' << completed << '/' << total << ") ";
     cerr << "ETA " << fixed << setprecision(1) << eta << 's';
-    if (completed >= total) {
-        cerr << '\n';
-    }
+    if (completed >= total) cerr << '\n';
     cerr.flush();
 }
 
 static size_t estimateMemoryBytes(size_t n, long long m) {
     size_t total = 0;
-    total += sizeof(vector<int>) * n;                  // adjacency list headers
-    total += sizeof(int) * static_cast<size_t>(m);     // adjacency edges
-    total += sizeof(vector<int>) * n;                  // predecessor list headers
-    total += sizeof(int) * static_cast<size_t>(m);     // predecessor edges (worst-case)
-    total += sizeof(int) * n;                          // reverse id map
-    total += sizeof(long long) * n;                    // sigma
-    total += sizeof(int) * n;                          // distance
-    total += sizeof(double) * n;                       // delta
-    total += sizeof(double) * n;                       // betweenness
-    total += sizeof(int) * n;                          // BFS/stack storage
-    total += sizeof(int) * n;                          // queue storage
-    total += sizeof(int) * n;                          // visited vertices
+    total += sizeof(vector<int>) * n;
+    total += sizeof(int) * static_cast<size_t>(m);
+    total += sizeof(vector<int>) * n;
+    total += sizeof(int) * static_cast<size_t>(m);
+    total += sizeof(int) * n;
+    total += sizeof(long long) * n;
+    total += sizeof(int) * n;
+    total += sizeof(double) * n;
+    total += sizeof(double) * n;
+    total += sizeof(int) * n;
+    total += sizeof(int) * n;
+    total += sizeof(int) * n;
     return total;
 }
 
 static Graph loadGraph(const string& filename) {
     ifstream input(filename);
-    if (!input) {
-        throw runtime_error("Failed to open input file: " + filename);
-    }
+    if (!input) throw runtime_error("Failed to open input file: " + filename);
 
     Graph graph;
     unordered_map<int, int> id_to_index;
@@ -123,23 +119,15 @@ static Graph loadGraph(const string& filename) {
 
     string line;
     while (getline(input, line)) {
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
+        if (line.empty() || line[0] == '#') continue;
 
         istringstream iss(line);
-        int from = 0;
-        int to = 0;
-        if (!(iss >> from >> to)) {
-            continue;
-        }
+        int from = 0, to = 0;
+        if (!(iss >> from >> to)) continue;
 
         auto mapNode = [&](int original_id) -> int {
             auto it = id_to_index.find(original_id);
-            if (it != id_to_index.end()) {
-                return it->second;
-            }
-
+            if (it != id_to_index.end()) return it->second;
             int new_index = static_cast<int>(graph.adj.size());
             id_to_index.emplace(original_id, new_index);
             graph.adj.emplace_back();
@@ -158,85 +146,113 @@ static Graph loadGraph(const string& filename) {
 
 static Result computeBetweenness(const Graph& graph) {
     const int n = static_cast<int>(graph.adj.size());
-    vector<double> cb(n, 0.0);
-    vector<long long> sigma(n, 0);
-    vector<int> dist(n, -1);
-    vector<double> delta(n, 0.0);
-    vector<vector<int>> predecessors(n);
-    vector<int> stack_order;
-    vector<int> visited;
 
-    stack_order.reserve(n);
-    visited.reserve(n);
+    // Global betweenness array — each thread accumulates into its own slice,
+    // then we reduce. Using a flat array avoids false sharing.
+    vector<double> cb(n, 0.0);
 
     const double rss_before = currentRSSMB();
     const auto start = chrono::steady_clock::now();
+
+    // Atomic counter for progress bar (updated by threads)
+    atomic<int> progress_counter{0};
     const int progress_interval = max(1, n / 200);
 
-    for (int source = 0; source < n; ++source) {
-        queue<int> bfs_queue;
-        stack_order.clear();
-        visited.clear();
+    // ---------------------------------------------------------------
+    // Parallel Brandes: each thread owns its own working buffers.
+    // schedule(dynamic,16) handles the load imbalance between source
+    // nodes in sparse vs. dense parts of the graph.
+    // ---------------------------------------------------------------
+    #pragma omp parallel
+    {
+        // Per-thread buffers — allocated once, reused every iteration
+        vector<long long> sigma(n, 0);
+        vector<int>       dist(n, -1);
+        vector<double>    delta(n, 0.0);
+        vector<vector<int>> predecessors(n);
+        vector<int>       stack_order;
+        vector<int>       visited;
+        vector<double>    local_cb(n, 0.0);  // thread-local accumulator
 
-        sigma[source] = 1;
-        dist[source] = 0;
-        visited.push_back(source);
-        bfs_queue.push(source);
+        stack_order.reserve(n);
+        visited.reserve(n);
 
-        while (!bfs_queue.empty()) {
-            int v = bfs_queue.front();
-            bfs_queue.pop();
-            stack_order.push_back(v);
+        #pragma omp for schedule(dynamic, 16) nowait
+        for (int source = 0; source < n; ++source) {
+            queue<int> bfs_queue;
+            stack_order.clear();
+            visited.clear();
 
-            for (int w : graph.adj[v]) {
-                if (dist[w] < 0) {
-                    dist[w] = dist[v] + 1;
-                    bfs_queue.push(w);
-                    visited.push_back(w);
+            sigma[source] = 1;
+            dist[source]  = 0;
+            visited.push_back(source);
+            bfs_queue.push(source);
+
+            // --- BFS forward pass ---
+            while (!bfs_queue.empty()) {
+                int v = bfs_queue.front();
+                bfs_queue.pop();
+                stack_order.push_back(v);
+
+                for (int w : graph.adj[v]) {
+                    if (dist[w] < 0) {
+                        dist[w] = dist[v] + 1;
+                        bfs_queue.push(w);
+                        visited.push_back(w);
+                    }
+                    if (dist[w] == dist[v] + 1) {
+                        sigma[w] += sigma[v];
+                        predecessors[w].push_back(v);
+                    }
                 }
-                if (dist[w] == dist[v] + 1) {
-                    sigma[w] += sigma[v];
-                    predecessors[w].push_back(v);
+            }
+
+            // --- Back-propagation pass ---
+            for (auto it = stack_order.rbegin(); it != stack_order.rend(); ++it) {
+                int w = *it;
+                for (int v : predecessors[w]) {
+                    if (sigma[w] != 0) {
+                        delta[v] += (static_cast<double>(sigma[v]) /
+                                     static_cast<double>(sigma[w])) * (1.0 + delta[w]);
+                    }
                 }
+                if (w != source) {
+                    local_cb[w] += delta[w];
+                }
+            }
+
+            // --- Reset only touched nodes ---
+            for (int v : visited) {
+                sigma[v]       = 0;
+                dist[v]        = -1;
+                delta[v]       = 0.0;
+                predecessors[v].clear();
+            }
+
+            // Progress reporting (one thread at a time, cheap atomic)
+            int done = ++progress_counter;
+            if (done % progress_interval == 0 || done == n) {
+                #pragma omp critical
+                showProgressBar(done, n, start);
             }
         }
 
-        for (auto it = stack_order.rbegin(); it != stack_order.rend(); ++it) {
-            int w = *it;
-            for (int v : predecessors[w]) {
-                if (sigma[w] != 0) {
-                    delta[v] += (static_cast<double>(sigma[v]) / static_cast<double>(sigma[w])) * (1.0 + delta[w]);
-                }
-            }
-            if (w != source) {
-                cb[w] += delta[w];
-            }
-        }
-
-        for (int v : visited) {
-            sigma[v] = 0;
-            dist[v] = -1;
-            delta[v] = 0.0;
-            predecessors[v].clear();
-        }
-
-        if ((source + 1) % progress_interval == 0 || source + 1 == n) {
-            showProgressBar(source + 1, n, start);
+        // Reduce thread-local results into global cb
+        #pragma omp critical
+        for (int i = 0; i < n; ++i) {
+            cb[i] += local_cb[i];
         }
     }
 
     const auto end = chrono::steady_clock::now();
     const double rss_after = currentRSSMB();
 
+    // --- Sort and extract top 20 ---
     vector<int> order(n);
-    for (int i = 0; i < n; ++i) {
-        order[i] = i;
-    }
+    for (int i = 0; i < n; ++i) order[i] = i;
 
     sort(order.begin(), order.end(), [&](int lhs, int rhs) {
-        if (cb[lhs] == cb[rhs]) {
-            return graph.reverse_ids[lhs] < graph.reverse_ids[rhs];
-        }
+        if (cb[lhs] == cb[rhs]) return graph.reverse_ids[lhs] < graph.reverse_ids[rhs];
         return cb[lhs] > cb[rhs];
     });
 
@@ -249,14 +265,14 @@ static Result computeBetweenness(const Graph& graph) {
     }
 
     result.execution_seconds = chrono::duration<double>(end - start).count();
-    result.analytical_memory_mb = bytesToMB(estimateMemoryBytes(static_cast<size_t>(n), graph.edge_count));
+    result.analytical_memory_mb = bytesToMB(
+        estimateMemoryBytes(static_cast<size_t>(n), graph.edge_count));
 
     double rss_delta = 0.0;
-    if (rss_before > 0.0 && rss_after >= rss_before) {
+    if (rss_before > 0.0 && rss_after >= rss_before)
         rss_delta = rss_after - rss_before;
-    } else if (rss_after > 0.0) {
+    else if (rss_after > 0.0)
         rss_delta = rss_after;
-    }
 
     result.memory_usage_mb = max(rss_delta, result.analytical_memory_mb);
     return result;
@@ -268,8 +284,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const string filename = argv[1];
+    cerr << "Using " << omp_get_max_threads() << " OpenMP threads\n";
 
+    const string filename = argv[1];
     try {
         Graph graph = loadGraph(filename);
         Result result = computeBetweenness(graph);
@@ -277,7 +294,8 @@ int main(int argc, char* argv[]) {
         cout << "========================================" << '\n';
         cout << "Dataset: " << filename << '\n';
         cout << "========================================" << '\n';
-        cout << "Graph loaded: " << graph.adj.size() << " nodes, " << graph.edge_count << " edges" << '\n';
+        cout << "Graph loaded: " << graph.adj.size() << " nodes, "
+             << graph.edge_count << " edges" << '\n';
         cout << '\n';
         cout << "--- Top 20 Nodes by Betweenness Centrality ---" << '\n';
         cout << left << setw(7) << "Rank"
