@@ -1,0 +1,11 @@
+A. Team Information
+[PLACEHOLDER - fill in your team's names and IDs]
+Student 1: Name -- ID
+Student 2: Name -- ID
+
+B. Individual Contributions
+[PLACEHOLDER - fill in each member's contribution]
+
+C. Program Output
+
+[Run `bash run.sh` to populate this section.]
