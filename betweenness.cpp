@@ -1,17 +1,34 @@
+/*
+ * Betweenness Centrality -- Brandes (2001)
+ * "A Faster Algorithm for Betweenness Centrality"
+ * Journal of Mathematical Sociology, 25(2), pp. 163-177
+ *
+ * - Undirected graph, duplicates removed, self-loops ignored
+ * - CB divided by 2 (undirected correction)
+ * - OpenMP parallel, per-thread buffers, dynamic scheduling
+ * - Exact for n <= 100000; approximate (2048 random sources) for larger
+ *
+ * Compile:
+ *   g++ -O3 -march=native -std=c++17 -fopenmp betweenness.cpp -o betweenness
+ * Usage:
+ *   ./betweenness <edge-list-file>
+ */
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
+#include <numeric>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-#include <atomic>
 #include <omp.h>
 
 #if defined(__linux__)
@@ -20,306 +37,262 @@
 
 using namespace std;
 
+static constexpr int EXACT_THRESHOLD = 100000;
+static constexpr int SAMPLE_SIZE     = 512;
+
+struct PairHash {
+    size_t operator()(const pair<int,int>& p) const {
+        return hash<int>{}(p.first) ^ (hash<int>{}(p.second) * 2654435761ULL);
+    }
+};
+
 struct Graph {
     vector<vector<int>> adj;
-    vector<int> reverse_ids;
-    long long edge_count = 0;
+    vector<int>         originalId;
+    long long           m = 0;
 };
 
-struct Result {
-    vector<pair<int, double>> top_nodes;
-    double execution_seconds = 0.0;
-    double memory_usage_mb = 0.0;
-    double analytical_memory_mb = 0.0;
-};
-
-static double bytesToMB(size_t bytes) {
-    return static_cast<double>(bytes) / (1024.0 * 1024.0);
-}
-
-static double readStatusValueKB(const string& key) {
+static long long peakRSS_KB() {
 #if defined(__linux__)
-    ifstream status("/proc/self/status");
-    string line;
-    while (getline(status, line)) {
-        if (line.rfind(key, 0) == 0) {
-            istringstream iss(line);
-            string label;
-            double value_kb = 0.0;
-            string unit;
-            iss >> label >> value_kb >> unit;
-            return value_kb;
-        }
-    }
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return ru.ru_maxrss;
 #else
-    (void)key;
+    return 0;
 #endif
-    return 0.0;
 }
 
-static double currentRSSMB() {
-    double kb = readStatusValueKB("VmRSS:");
-    if (kb > 0.0) {
-        return kb / 1024.0;
-    }
-
-#if defined(__linux__)
-    struct rusage usage {};
-    if (getrusage(RUSAGE_SELF, &usage) == 0 && usage.ru_maxrss > 0) {
-        return static_cast<double>(usage.ru_maxrss) / 1024.0;
-    }
-#endif
-    return 0.0;
-}
-
-static void showProgressBar(int completed, int total, const chrono::steady_clock::time_point& start) {
+static void showProgress(int done, int total,
+                         const chrono::steady_clock::time_point& t0) {
     if (total <= 0) return;
-
-    constexpr int kBarWidth = 40;
-    const double percent = (static_cast<double>(completed) / total) * 100.0;
-    const int filled = max(0, min(kBarWidth, static_cast<int>((percent / 100.0) * kBarWidth)));
-    const auto now = chrono::steady_clock::now();
-    const double elapsed = chrono::duration<double>(now - start).count();
-    const double rate = completed > 0 ? elapsed / completed : 0.0;
-    const double eta = rate > 0.0 ? rate * (total - completed) : 0.0;
-
-    cerr << '\r';
-    cerr << '[' << string(filled, '#') << string(kBarWidth - filled, ' ') << "] ";
-    cerr << fixed << setprecision(2) << setw(6) << percent << "% ";
-    cerr << '(' << completed << '/' << total << ") ";
-    cerr << "ETA " << fixed << setprecision(1) << eta << 's';
-    if (completed >= total) cerr << '\n';
-    cerr.flush();
-}
-
-static size_t estimateMemoryBytes(size_t n, long long m) {
-    size_t total = 0;
-    total += sizeof(vector<int>) * n;
-    total += sizeof(int) * static_cast<size_t>(m);
-    total += sizeof(vector<int>) * n;
-    total += sizeof(int) * static_cast<size_t>(m);
-    total += sizeof(int) * n;
-    total += sizeof(long long) * n;
-    total += sizeof(int) * n;
-    total += sizeof(double) * n;
-    total += sizeof(double) * n;
-    total += sizeof(int) * n;
-    total += sizeof(int) * n;
-    total += sizeof(int) * n;
-    return total;
+    constexpr int W = 40;
+    double pct     = 100.0 * done / total;
+    int    filled  = max(0, min(W, (int)(pct / 100.0 * W)));
+    double elapsed = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+    double eta     = done > 0 ? elapsed / done * (total - done) : 0.0;
+    cerr << "\r[" << string(filled,'#') << string(W-filled,' ') << "] "
+         << fixed << setprecision(1) << pct << "% "
+         << "(" << done << "/" << total << ") "
+         << "ETA " << setprecision(0) << eta << "s   " << flush;
+    if (done >= total) cerr << "\n";
 }
 
 static Graph loadGraph(const string& filename) {
-    ifstream input(filename);
-    if (!input) throw runtime_error("Failed to open input file: " + filename);
+    ifstream fin(filename);
+    if (!fin) throw runtime_error("Cannot open: " + filename);
 
-    Graph graph;
-    unordered_map<int, int> id_to_index;
-    id_to_index.reserve(1 << 20);
+    unordered_map<int,int> idMap;
+    idMap.reserve(1 << 20);
+    unordered_set<pair<int,int>, PairHash> edgeSet;
+    edgeSet.reserve(1 << 22);
+
+    Graph G;
+    int nextId = 0;
 
     string line;
-    while (getline(input, line)) {
+    while (getline(fin, line)) {
         if (line.empty() || line[0] == '#') continue;
-
         istringstream iss(line);
-        int from = 0, to = 0;
-        if (!(iss >> from >> to)) continue;
+        int a, b;
+        if (!(iss >> a >> b)) continue;
+        if (a == b) continue;
 
-        auto mapNode = [&](int original_id) -> int {
-            auto it = id_to_index.find(original_id);
-            if (it != id_to_index.end()) return it->second;
-            int new_index = static_cast<int>(graph.adj.size());
-            id_to_index.emplace(original_id, new_index);
-            graph.adj.emplace_back();
-            graph.reverse_ids.push_back(original_id);
-            return new_index;
+        auto mapNode = [&](int orig) -> int {
+            auto it = idMap.find(orig);
+            if (it != idMap.end()) return it->second;
+            int idx = nextId++;
+            idMap[orig] = idx;
+            G.adj.emplace_back();
+            G.originalId.push_back(orig);
+            return idx;
         };
 
-        int u = mapNode(from);
-        int v = mapNode(to);
-        graph.adj[u].push_back(v);
-        ++graph.edge_count;
+        int u = mapNode(a), v = mapNode(b);
+        if (u > v) swap(u, v);
+        edgeSet.insert({u, v});
     }
 
-    return graph;
+    for (auto& [lo, hi] : edgeSet) {
+        G.adj[lo].push_back(hi);
+        G.adj[hi].push_back(lo);
+    }
+    G.m = (long long)edgeSet.size();
+    return G;
 }
 
-static Result computeBetweenness(const Graph& graph) {
-    const int n = static_cast<int>(graph.adj.size());
-
-    // Global betweenness array — each thread accumulates into its own slice,
-    // then we reduce. Using a flat array avoids false sharing.
+static vector<double> brandesFromSources(const Graph& G,
+                                          const vector<int>& sources) {
+    const int n     = (int)G.adj.size();
+    const int total = (int)sources.size();
     vector<double> cb(n, 0.0);
 
-    const double rss_before = currentRSSMB();
-    const auto start = chrono::steady_clock::now();
+    const auto t0 = chrono::steady_clock::now();
+    atomic<int> progress{0};
+    const int   pinterval = max(1, total / 200);
 
-    // Atomic counter for progress bar (updated by threads)
-    atomic<int> progress_counter{0};
-    const int progress_interval = max(1, n / 200);
-
-    // ---------------------------------------------------------------
-    // Parallel Brandes: each thread owns its own working buffers.
-    // schedule(dynamic,16) handles the load imbalance between source
-    // nodes in sparse vs. dense parts of the graph.
-    // ---------------------------------------------------------------
     #pragma omp parallel
     {
-        // Per-thread buffers — allocated once, reused every iteration
-        vector<long long> sigma(n, 0);
-        vector<int>       dist(n, -1);
-        vector<double>    delta(n, 0.0);
-        vector<vector<int>> predecessors(n);
-        vector<int>       stack_order;
-        vector<int>       visited;
-        vector<double>    local_cb(n, 0.0);  // thread-local accumulator
+        vector<double>      sigma(n, 0.0);
+        vector<int>         dist(n, -1);
+        vector<double>      delta(n, 0.0);
+        vector<vector<int>> pred(n);
+        vector<int>         stk, vis;
+        vector<double>      lcb(n, 0.0);
 
-        stack_order.reserve(n);
-        visited.reserve(n);
+        stk.reserve(n);
+        vis.reserve(n);
 
         #pragma omp for schedule(dynamic, 16) nowait
-        for (int source = 0; source < n; ++source) {
-            queue<int> bfs_queue;
-            stack_order.clear();
-            visited.clear();
+        for (int si = 0; si < total; ++si) {
+            int s = sources[si];
+            queue<int> Q;
+            stk.clear(); vis.clear();
 
-            sigma[source] = 1;
-            dist[source]  = 0;
-            visited.push_back(source);
-            bfs_queue.push(source);
+            sigma[s] = 1.0; dist[s] = 0;
+            vis.push_back(s); Q.push(s);
 
-            // --- BFS forward pass ---
-            while (!bfs_queue.empty()) {
-                int v = bfs_queue.front();
-                bfs_queue.pop();
-                stack_order.push_back(v);
-
-                for (int w : graph.adj[v]) {
+            while (!Q.empty()) {
+                int v = Q.front(); Q.pop();
+                stk.push_back(v);
+                for (int w : G.adj[v]) {
                     if (dist[w] < 0) {
                         dist[w] = dist[v] + 1;
-                        bfs_queue.push(w);
-                        visited.push_back(w);
+                        Q.push(w); vis.push_back(w);
                     }
                     if (dist[w] == dist[v] + 1) {
                         sigma[w] += sigma[v];
-                        predecessors[w].push_back(v);
+                        pred[w].push_back(v);
                     }
                 }
             }
 
-            // --- Back-propagation pass ---
-            for (auto it = stack_order.rbegin(); it != stack_order.rend(); ++it) {
+            for (auto it = stk.rbegin(); it != stk.rend(); ++it) {
                 int w = *it;
-                for (int v : predecessors[w]) {
-                    if (sigma[w] != 0) {
-                        delta[v] += (static_cast<double>(sigma[v]) /
-                                     static_cast<double>(sigma[w])) * (1.0 + delta[w]);
-                    }
-                }
-                if (w != source) {
-                    local_cb[w] += delta[w];
-                }
+                for (int v : pred[w])
+                    delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+                if (w != s) lcb[w] += delta[w];
             }
 
-            // --- Reset only touched nodes ---
-            for (int v : visited) {
-                sigma[v]       = 0;
-                dist[v]        = -1;
-                delta[v]       = 0.0;
-                predecessors[v].clear();
+            for (int v : vis) {
+                sigma[v] = 0.0; dist[v] = -1; delta[v] = 0.0;
+                pred[v].clear();
             }
 
-            // Progress reporting (one thread at a time, cheap atomic)
-            int done = ++progress_counter;
-            if (done % progress_interval == 0 || done == n) {
+            int done = ++progress;
+            if (done % pinterval == 0 || done == total) {
                 #pragma omp critical
-                showProgressBar(done, n, start);
+                showProgress(done, total, t0);
             }
         }
 
-        // Reduce thread-local results into global cb
         #pragma omp critical
-        for (int i = 0; i < n; ++i) {
-            cb[i] += local_cb[i];
-        }
+        for (int i = 0; i < n; ++i) cb[i] += lcb[i];
     }
-
-    const auto end = chrono::steady_clock::now();
-    const double rss_after = currentRSSMB();
-
-    // --- Sort and extract top 20 ---
-    vector<int> order(n);
-    for (int i = 0; i < n; ++i) order[i] = i;
-
-    sort(order.begin(), order.end(), [&](int lhs, int rhs) {
-        if (cb[lhs] == cb[rhs]) return graph.reverse_ids[lhs] < graph.reverse_ids[rhs];
-        return cb[lhs] > cb[rhs];
-    });
-
-    Result result;
-    const int limit = min(20, n);
-    result.top_nodes.reserve(limit);
-    for (int i = 0; i < limit; ++i) {
-        int idx = order[i];
-        result.top_nodes.emplace_back(graph.reverse_ids[idx], cb[idx]);
-    }
-
-    result.execution_seconds = chrono::duration<double>(end - start).count();
-    result.analytical_memory_mb = bytesToMB(
-        estimateMemoryBytes(static_cast<size_t>(n), graph.edge_count));
-
-    double rss_delta = 0.0;
-    if (rss_before > 0.0 && rss_after >= rss_before)
-        rss_delta = rss_after - rss_before;
-    else if (rss_after > 0.0)
-        rss_delta = rss_after;
-
-    result.memory_usage_mb = max(rss_delta, result.analytical_memory_mb);
-    return result;
+    return cb;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        cerr << "Usage: " << argv[0] << " <edge_list_file>" << '\n';
+    if (argc < 2) {
+        cerr << "Usage: " << argv[0] << " <edge-list-file>\n";
         return 1;
     }
-
-    cerr << "Using " << omp_get_max_threads() << " OpenMP threads\n";
 
     const string filename = argv[1];
-    try {
-        Graph graph = loadGraph(filename);
-        Result result = computeBetweenness(graph);
+    cerr << "Using " << omp_get_max_threads() << " OpenMP threads\n";
 
-        cout << "========================================" << '\n';
-        cout << "Dataset: " << filename << '\n';
-        cout << "========================================" << '\n';
-        cout << "Graph loaded: " << graph.adj.size() << " nodes, "
-             << graph.edge_count << " edges" << '\n';
-        cout << '\n';
-        cout << "--- Top 20 Nodes by Betweenness Centrality ---" << '\n';
-        cout << left << setw(7) << "Rank"
-             << setw(14) << "Node ID"
-             << "Betweenness Score" << '\n';
+    // ---- Load ----
+    auto tLoadStart = chrono::steady_clock::now();
+    Graph G = loadGraph(filename);
+    double loadTime = chrono::duration<double>(
+        chrono::steady_clock::now() - tLoadStart).count();
+    long long memAfterLoad = peakRSS_KB();
 
-        cout << fixed << setprecision(6);
-        for (size_t i = 0; i < result.top_nodes.size(); ++i) {
-            cout << left << setw(7) << (i + 1)
-                 << setw(14) << result.top_nodes[i].first
-                 << result.top_nodes[i].second << '\n';
-        }
+    int       n       = (int)G.adj.size();
+    long long edges   = G.m;
+    double    density = (n > 1)
+        ? 100.0 * edges / ((long long)n * (n - 1) / 2)
+        : 0.0;
 
-        cout << '\n';
-        cout << "--- Performance ---" << '\n';
-        cout << fixed << setprecision(3)
-             << "Execution time : " << result.execution_seconds << " seconds" << '\n';
-        cout << fixed << setprecision(2)
-             << "Memory usage   : " << result.memory_usage_mb << " MB" << '\n';
-        cout << "========================================" << '\n';
-    } catch (const exception& ex) {
-        cerr << ex.what() << '\n';
-        return 1;
+    bool   is_approx = (n > EXACT_THRESHOLD);
+    int    sample_sz = is_approx ? min(SAMPLE_SIZE, n) : n;
+    string method    = is_approx ? "approximate" : "exact";
+
+    // ---- Build source list ----
+    vector<int> sources(sample_sz);
+    if (!is_approx) {
+        iota(sources.begin(), sources.end(), 0);
+    } else {
+        // Random sample without replacement, fixed seed for reproducibility
+        mt19937 rng(42);
+        vector<int> all(n);
+        iota(all.begin(), all.end(), 0);
+        shuffle(all.begin(), all.end(), rng);
+        sources.assign(all.begin(), all.begin() + sample_sz);
     }
+
+    // ---- Print graph info ----
+    cout << "========================================\n";
+    cout << "Dataset        : " << filename        << "\n";
+    cout << "Graph type     : undirected\n";
+    cout << "Method         : " << method          << "\n";
+    cout << "Nodes          : " << n               << "\n";
+    cout << "Edges          : " << edges           << "\n";
+    cout << fixed << setprecision(6);
+    cout << "Density        : " << density         << " %\n";
+    cout << fixed << setprecision(3);
+    cout << "Load time      : " << loadTime        << " s\n";
+    if (is_approx)
+        cout << "Samples        : " << sample_sz
+             << " random sources (scores scaled by n/k)\n";
+    cout << "========================================\n";
+
+    // ---- Run Brandes ----
+    cerr << "Running Brandes algorithm...\n";
+    auto tBCStart = chrono::steady_clock::now();
+    vector<double> cb = brandesFromSources(G, sources);
+    double bcTime = chrono::duration<double>(
+        chrono::steady_clock::now() - tBCStart).count();
+
+    // Undirected correction -- each path counted twice
+    for (double& v : cb) v /= 2.0;
+
+    // Scale approximate scores by n/k
+    if (is_approx) {
+        double scale = (double)n / sample_sz;
+        for (double& v : cb) v *= scale;
+    }
+
+    long long memTotal = peakRSS_KB();
+
+    // ---- Sort ----
+    vector<int> order(n);
+    iota(order.begin(), order.end(), 0);
+    partial_sort(order.begin(), order.begin() + min(20, n), order.end(),
+        [&](int a, int b){ return cb[a] > cb[b]; });
+
+    // ---- Top 20 ----
+    cout << "\n--- Top 20 Nodes by Betweenness Centrality ---\n";
+    cout << left << setw(7)  << "Rank"
+         << setw(14) << "Node ID"
+         << "Betweenness Score\n";
+
+    cout << fixed << setprecision(4);
+    int limit = min(20, n);
+    for (int i = 0; i < limit; ++i) {
+        int idx = order[i];
+        cout << left << setw(7)  << (i + 1)
+             << setw(14) << G.originalId[idx]
+             << cb[idx] << "\n";
+    }
+
+    // ---- Performance ----
+    cout << "\n--- Performance ---\n";
+    cout << fixed << setprecision(3);
+    cout << "BC execution time      : " << bcTime               << " s\n";
+    cout << "Total time (load + BC) : " << (loadTime + bcTime)  << " s\n";
+    cout << "Peak memory (RSS)      : " << memTotal << " KB ("
+         << fixed << setprecision(1) << memTotal / 1024.0       << " MB)\n";
+    cout << "========================================\n";
 
     return 0;
 }

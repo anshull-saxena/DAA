@@ -7,8 +7,8 @@ cd "$ROOT_DIR"
 
 declare -a DATASETS=(
   "email-Enron.txt https://snap.stanford.edu/data/email-Enron.txt.gz"
-  "as-skitter.txt https://snap.stanford.edu/data/as-skitter.txt.gz"
   "wiki-Vote.txt https://snap.stanford.edu/data/wiki-Vote.txt.gz"
+  "as-skitter.txt https://snap.stanford.edu/data/as-skitter.txt.gz"
 )
 
 write_report() {
@@ -61,18 +61,22 @@ for entry in "${DATASETS[@]}"; do
 done
 
 echo "Compiling betweenness.cpp"
-# -fopenmp enables parallelism; -O3 + -march=native give extra ~20% on top
 g++ -O3 -march=native -std=c++17 -fopenmp betweenness.cpp -o betweenness
 
 : > results.txt
 
 for entry in "${DATASETS[@]}"; do
   filename="${entry%% *}"
-  {
-    echo "Running dataset: $filename"
-    ./betweenness "$filename"
-    echo
-  } | tee -a results.txt
+  # derive per-dataset output filename: email-Enron.txt -> result_email-Enron.txt
+  result_file="result_${filename}"
+
+  echo "Running dataset: $filename"
+
+  # run, save to individual file, and also append to combined results.txt
+  ./betweenness "$filename" | tee "$result_file" >> results.txt
+  echo "" >> results.txt
+
+  echo "  -> saved to $result_file"
 done
 
 write_report
